@@ -2,7 +2,7 @@
 
 import asyncio
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict
 
 from loguru import logger
 
@@ -13,7 +13,7 @@ from nanobot.config.schema import QQConfig
 
 try:
     import botpy
-    from botpy.message import C2CMessage
+    from botpy.message import C2CMessage, GroupMessage
 
     QQ_AVAILABLE = True
 except ImportError:
@@ -42,6 +42,10 @@ def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
         async def on_direct_message_create(self, message):
             await channel._on_message(message)
 
+        async def on_group_at_message_create(self, message: "GroupMessage"):
+            print("group:", message)
+            await channel._on_group_message(message)
+
     return _Bot
 
 
@@ -56,6 +60,7 @@ class QQChannel(BaseChannel):
         self._client: "botpy.Client | None" = None
         self._processed_ids: deque = deque(maxlen=1000)
         self._bot_task: asyncio.Task | None = None
+        self._chat_type_cache: Dict[str, str] = {}
 
     async def start(self) -> None:
         """Start the QQ bot."""
@@ -98,17 +103,29 @@ class QQChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through QQ."""
+        # Distinguish between group and private message
+        msg_type = self._chat_type_cache.get(msg.chat_id, "c2c")
         if not self._client:
             logger.warning("QQ client not initialized")
             return
-        try:
-            await self._client.api.post_c2c_message(
-                openid=msg.chat_id,
-                msg_type=0,
-                content=msg.content,
+        
+        if msg_type == "group":
+            # Send group message
+            await self._client.api.post_group_message(
+                group_openid=msg.chat_id,
+                msg_type=0, 
+                msg_id=msg.metadata.get("message_id"), # Reply to specific message ID (optional but recommended)
+                content=msg.content
             )
-        except Exception as e:
-            logger.error(f"Error sending QQ message: {e}")
+        else:
+            try:
+                await self._client.api.post_c2c_message(
+                    openid=msg.chat_id,
+                    msg_type=0,
+                    content=msg.content,
+                )
+            except Exception as e:
+                logger.error(f"Error sending QQ message: {e}")
 
     async def _on_message(self, data: "C2CMessage") -> None:
         """Handle incoming message from QQ."""
@@ -127,6 +144,31 @@ class QQChannel(BaseChannel):
             await self._handle_message(
                 sender_id=user_id,
                 chat_id=user_id,
+                content=content,
+                metadata={"message_id": data.id},
+            )
+        except Exception as e:
+            logger.error(f"Error handling QQ message: {e}")
+
+    async def _on_group_message(self, data: "GroupMessage") -> None:
+        """Handle incoming message from QQ. Group Message"""
+        try:
+            # Dedup by message ID
+            if data.id in self._processed_ids:
+                return
+            self._processed_ids.append(data.id)
+
+            author = data.author
+            chat_id = data.group_openid
+            user_id = str(getattr(author, 'id', None) or getattr(author, 'member_openid', 'unknown'))
+            self._chat_type_cache[chat_id] = "group"
+            content = (data.content or "").strip()
+            if not content:
+                return
+
+            await self._handle_message(
+                sender_id=user_id,
+                chat_id=chat_id,
                 content=content,
                 metadata={"message_id": data.id},
             )
