@@ -261,6 +261,28 @@ class AgentLoop:
         await self._connect_mcp()
         logger.info("Agent loop started")
 
+        restart_marker = self.workspace / ".restart_context"
+        if restart_marker.exists():
+            try:
+                data = json.loads(restart_marker.read_text())
+                channel = data.get("channel")
+                chat_id = data.get("chat_id")
+                
+                if channel and chat_id:
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content="✅ **System Restarted Successfully!**\nI'm back online and ready to help."
+                    ))
+                    logger.info(f"Sent restart notification to {channel}:{chat_id}")
+            except Exception as e:
+                logger.error(f"Error processing restart context: {e}")
+            finally:
+                try:
+                    restart_marker.unlink()
+                except FileNotFoundError:
+                    pass
+
         while self._running:
             try:
                 msg = await asyncio.wait_for(
@@ -374,6 +396,33 @@ class AgentLoop:
             self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
+        
+        if cmd == "/restart":
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, 
+                chat_id=msg.chat_id,
+                content="🔄 System is restarting..."
+            ))
+
+            try:
+                restart_marker = self.workspace / ".restart_context"
+                restart_info = {
+                    "channel": msg.channel,
+                    "chat_id": msg.chat_id,
+                    "timestamp": msg.metadata.get("timestamp")
+                }
+                restart_marker.write_text(json.dumps(restart_info))
+            except Exception as e:
+                logger.error(f"Failed to save restart context: {e}")
+
+            logger.warning("Received /restart command. Exiting process.")
+            self.stop()
+            # 给 IO 一点缓冲时间
+            await asyncio.sleep(0.5)
+            import sys
+            sys.exit(0)
+
+        
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
